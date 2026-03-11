@@ -165,7 +165,13 @@ def auth_login():
         cur.close()
         conn.close()
         pw_hash = _password_hash_bytes(row[3]) if row else None
-        if not row or not pw_hash or not bcrypt.checkpw(password.encode("utf-8"), pw_hash):
+        if not row or not pw_hash:
+            return jsonify({"error": "Invalid email or password"}), 401
+        try:
+            if not bcrypt.checkpw(password.encode("utf-8"), pw_hash):
+                return jsonify({"error": "Invalid email or password"}), 401
+        except (ValueError, TypeError) as e:
+            app.logger.warning("bcrypt.checkpw failed: %s", e)
             return jsonify({"error": "Invalid email or password"}), 401
         token = _create_jwt(row[0], row[1])
         resp = make_response(jsonify({"user": _user_response((row[0], row[1], row[2])), "token": token}))
@@ -180,6 +186,7 @@ def auth_login():
         )
         return resp
     except Exception as e:
+        app.logger.exception("Login failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -216,6 +223,262 @@ def auth_me():
         if not row:
             return jsonify({"user": None}), 200
         return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+@app.route("/api/prompts/today", methods=["GET"])
+def prompts_today():
+    """Return today's writing prompt. Requires auth. Priority: continuity prompts, then random fallback."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        # TODO: Add continuity prompts (from prior entries). For MVP, use random fallback.
+        cur.execute(
+            """
+            SELECT research_prompt_id, research_prompt_text, is_fallback
+            FROM tbl_research_prompts
+            WHERE is_fallback = true
+            ORDER BY RANDOM()
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"error": "No prompts available"}), 404
+        return jsonify({
+            "prompt": {
+                "id": row[0],
+                "text": row[1],
+                "is_fallback": row[2],
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Entries (CRUD)
+# ---------------------------------------------------------------------------
+
+def _entry_response(row):
+    """row: (id, user_id, prompt_id, title, raw_text, edited_text, summary, why_it_matters, branch_id, mystery_id, status, created_ts, updated_ts)"""
+    return {
+        "id": row[0],
+        "user_id": row[1],
+        "research_prompt_id": row[2],
+        "title": row[3],
+        "raw_text": row[4],
+        "edited_text": row[5],
+        "summary": row[6],
+        "why_it_matters": row[7],
+        "research_branch_id": row[8],
+        "research_mystery_id": row[9],
+        "status": row[10],
+        "created_at": row[11].isoformat() if row[11] else None,
+        "updated_at": row[12].isoformat() if row[12] else None,
+    }
+
+
+@app.route("/api/entries", methods=["GET"])
+def entries_list():
+    """List entries for the current user. Requires auth."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT research_entry_id, user_id, research_prompt_id, research_entry_title,
+                   research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                   research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                   research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            FROM tbl_research_entries
+            WHERE user_id = %s
+            ORDER BY research_entries_timestamp DESC
+            """,
+            (claims["user_id"],),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"entries": [_entry_response(r) for r in rows]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/entries", methods=["POST"])
+def entries_create():
+    """Create a new entry. Requires auth."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        data = request.get_json() or {}
+        raw_text = (data.get("raw_text") or "").strip()
+        research_prompt_id = data.get("research_prompt_id")
+        if not raw_text:
+            return jsonify({"error": "raw_text is required"}), 400
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO tbl_research_entries (user_id, research_prompt_id, research_entry_raw_text)
+            VALUES (%s, %s, %s)
+            RETURNING research_entry_id, user_id, research_prompt_id, research_entry_title,
+                      research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                      research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                      research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            """,
+            (claims["user_id"], research_prompt_id, raw_text),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"entry": _entry_response(row)}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/entries/today", methods=["GET"])
+def entries_today():
+    """Get today's entry (most recent from current UTC date). Requires auth."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT research_entry_id, user_id, research_prompt_id, research_entry_title,
+                   research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                   research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                   research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            FROM tbl_research_entries
+            WHERE user_id = %s AND DATE(research_entries_timestamp AT TIME ZONE 'UTC') = CURRENT_DATE
+            ORDER BY research_entries_timestamp DESC
+            LIMIT 1
+            """,
+            (claims["user_id"],),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"entry": None})
+        return jsonify({"entry": _entry_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/entries/<int:entry_id>", methods=["GET"])
+def entries_get(entry_id):
+    """Get a single entry. Requires auth; user must own the entry."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT research_entry_id, user_id, research_prompt_id, research_entry_title,
+                   research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                   research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                   research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            FROM tbl_research_entries
+            WHERE research_entry_id = %s AND user_id = %s
+            """,
+            (entry_id, claims["user_id"]),
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Entry not found"}), 404
+        return jsonify({"entry": _entry_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/entries/<int:entry_id>", methods=["PATCH"])
+def entries_update(entry_id):
+    """Update an entry (e.g. autosave). Requires auth; user must own the entry."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        data = request.get_json() or {}
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT research_entry_id FROM tbl_research_entries WHERE research_entry_id = %s AND user_id = %s",
+            (entry_id, claims["user_id"]),
+        )
+        if not cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Entry not found"}), 404
+
+        updates = []
+        params = []
+        if "raw_text" in data:
+            updates.append("research_entry_raw_text = %s")
+            params.append(data.get("raw_text") or "")
+        if "edited_text" in data:
+            updates.append("research_entry_edited_text = %s")
+            params.append(data.get("edited_text"))
+        if "title" in data:
+            updates.append("research_entry_title = %s")
+            params.append(data.get("title"))
+        if "research_branch_id" in data:
+            updates.append("research_branch_id = %s")
+            params.append(data.get("research_branch_id"))
+        if "research_mystery_id" in data:
+            updates.append("research_mystery_id = %s")
+            params.append(data.get("research_mystery_id"))
+        if "status" in data:
+            updates.append("research_entry_status = %s")
+            params.append(data.get("status"))
+
+        if not updates:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "No fields to update"}), 400
+
+        updates.append("research_entry_updated_timestamp = NOW()")
+        params.extend([entry_id, claims["user_id"]])
+
+        cur.execute(
+            f"""
+            UPDATE tbl_research_entries
+            SET {", ".join(updates)}
+            WHERE research_entry_id = %s AND user_id = %s
+            RETURNING research_entry_id, user_id, research_prompt_id, research_entry_title,
+                      research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                      research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                      research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            """,
+            params,
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"entry": _entry_response(row)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
