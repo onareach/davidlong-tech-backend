@@ -8,15 +8,15 @@ Flask API backend for davidlong.tech and Research Studio.
 
 ## Local development
 
-All commands run inside the project's virtual environment (`.venv`).
+All commands run inside the project's virtual environment (`venv`).
 
 ```bash
 # Option A: Use the run script (creates venv if needed, installs deps, starts Flask)
 ./run.sh
 
 # Option B: Manual
-python3 -m venv .venv
-source .venv/bin/activate   # or .venv\Scripts\activate on Windows
+python3 -m venv venv
+source venv/bin/activate   # or venv\Scripts\activate on Windows
 pip install -r requirements.txt
 
 # Set environment (or use .env)

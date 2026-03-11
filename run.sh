@@ -5,13 +5,13 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -d ".venv" ]; then
+if [ ! -d "venv" ]; then
   echo "Creating virtual environment..."
-  python3 -m venv .venv
+  python3 -m venv venv
 fi
 
 echo "Installing dependencies..."
-.venv/bin/pip install -q -r requirements.txt
+venv/bin/pip install -q -r requirements.txt
 
 echo "Starting Flask..."
-.venv/bin/flask run --port 5000
+venv/bin/flask run --port 5000
