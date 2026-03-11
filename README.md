@@ -1,0 +1,37 @@
+# davidlong.tech — Backend API
+
+Flask API backend for davidlong.tech and Research Studio.
+
+- **Frontend**: davidlong.tech (Next.js on Vercel)
+- **Backend**: This repo (Flask on Heroku)
+- **Database**: Heroku Postgres
+
+## Local development
+
+```bash
+# Create virtual environment
+python -m venv .venv
+source .venv/bin/activate  # or .venv\Scripts\activate on Windows
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Set environment (or use .env)
+export DATABASE_URL="postgresql://dev_user:dev123@localhost:5432/davidlong_tech?sslmode=disable"
+export JWT_SECRET="dev-secret-change-in-production"
+
+# Run
+flask run --port 5000
+# or: gunicorn app:app
+```
+
+## API
+
+- `GET /api/health` — Health check
+- Auth routes (TBD): `/api/auth/login`, `/api/auth/logout`, `/api/auth/me`
+
+## Deploy to Heroku
+
+```bash
+git push heroku main
+```
