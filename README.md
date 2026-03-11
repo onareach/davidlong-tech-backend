@@ -10,11 +10,26 @@ Flask API backend for davidlong.tech and Research Studio.
 
 ### Database setup (one-time)
 
-Create the `davidlong_tech` database. `dev_user` cannot create databases; run as postgres superuser:
+1. Create the `davidlong_tech` database (run as postgres superuser):
 
 ```bash
 psql -U postgres -d postgres -f scripts/create_database.sql
 # Or: sudo -u postgres psql -d postgres -f scripts/create_database.sql
+```
+
+2. If `dev_user` lacks schema permissions, grant them:
+
+```bash
+psql -U postgres -d davidlong_tech -c "GRANT ALL ON SCHEMA public TO dev_user; GRANT CREATE ON SCHEMA public TO dev_user;"
+```
+
+3. Run migrations:
+
+```bash
+PGPASSWORD=dev123 psql -d davidlong_tech -U dev_user -h localhost -f migrations/001_add_user_table.sql
+PGPASSWORD=dev123 psql -d davidlong_tech -U dev_user -h localhost -f migrations/002_add_password_reset_table.sql
+PGPASSWORD=dev123 psql -d davidlong_tech -U dev_user -h localhost -f migrations/003_add_research_studio_schema.sql
+PGPASSWORD=dev123 psql -d davidlong_tech -U dev_user -h localhost -f migrations/004_seed_research_studio.sql
 ```
 
 ### Running the backend

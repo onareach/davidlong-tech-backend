@@ -5,3 +5,8 @@
 
 CREATE DATABASE davidlong_tech;
 GRANT ALL PRIVILEGES ON DATABASE davidlong_tech TO dev_user;
+
+-- Connect and grant schema permissions (dev_user needs CREATE on public)
+\c davidlong_tech
+GRANT ALL ON SCHEMA public TO dev_user;
+GRANT CREATE ON SCHEMA public TO dev_user;
