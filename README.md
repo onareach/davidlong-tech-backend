@@ -57,7 +57,10 @@ flask run --port 5000
 ## API
 
 - `GET /api/health` — Health check
-- Auth routes (TBD): `/api/auth/login`, `/api/auth/logout`, `/api/auth/me`
+- `POST /api/auth/register` — Body: `{ email, password, display_name? }`
+- `POST /api/auth/login` — Body: `{ email, password }`; returns `{ user, token }`
+- `POST /api/auth/logout` — Clears auth cookie
+- `GET /api/auth/me` — Returns `{ user }` or `{ user: null }`; requires cookie or `Authorization: Bearer <token>`
 
 ## Deploy to Heroku
 
