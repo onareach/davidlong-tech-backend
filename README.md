@@ -8,6 +8,17 @@ Flask API backend for davidlong.tech and Research Studio.
 
 ## Local development
 
+### Database setup (one-time)
+
+Create the `davidlong_tech` database. `dev_user` cannot create databases; run as postgres superuser:
+
+```bash
+psql -U postgres -d postgres -f scripts/create_database.sql
+# Or: sudo -u postgres psql -d postgres -f scripts/create_database.sql
+```
+
+### Running the backend
+
 All commands run inside the project's virtual environment (`venv`).
 
 ```bash
