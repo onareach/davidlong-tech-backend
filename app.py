@@ -140,7 +140,7 @@ def auth_register():
             httponly=True,
             secure=request.is_secure or not app.debug,
             samesite="None" if (request.is_secure or not app.debug) else "Lax",
-            max_age=7 * 24 * 3600,
+            # Session cookie: no max_age so cookie is cleared when browser session ends (close tab/browser = sign out)
         )
         return resp
     except Exception as e:
@@ -182,7 +182,7 @@ def auth_login():
             httponly=True,
             secure=request.is_secure or not app.debug,
             samesite="None" if (request.is_secure or not app.debug) else "Lax",
-            max_age=7 * 24 * 3600,
+            # Session cookie: no max_age so cookie is cleared when browser session ends (close tab/browser = sign out)
         )
         return resp
     except Exception as e:
@@ -261,6 +261,68 @@ def prompts_today():
                 "text": row[1],
                 "is_fallback": row[2],
             }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Branches and Mysteries (read-only for dropdowns)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/branches", methods=["GET"])
+def branches_list():
+    """List all research branches. Requires auth."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT research_branch_id, research_branch_handle, research_branch_name
+            FROM tbl_research_branches
+            ORDER BY research_branch_name
+            """
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "branches": [
+                {"id": r[0], "handle": r[1], "name": r[2]}
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mysteries", methods=["GET"])
+def mysteries_list():
+    """List all research mysteries. Requires auth."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT research_mystery_id, research_mystery_handle, research_mystery_question
+            FROM tbl_research_mysteries
+            ORDER BY research_mystery_question
+            """
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "mysteries": [
+                {"id": r[0], "handle": r[1], "question": r[2]}
+                for r in rows
+            ]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -453,6 +515,12 @@ def entries_update(entry_id):
         if "status" in data:
             updates.append("research_entry_status = %s")
             params.append(data.get("status"))
+        if "summary" in data:
+            updates.append("research_entry_summary = %s")
+            params.append(data.get("summary"))
+        if "why_it_matters" in data:
+            updates.append("research_entry_why_it_matters = %s")
+            params.append(data.get("why_it_matters"))
 
         if not updates:
             cur.close()
