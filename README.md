@@ -48,6 +48,9 @@ pip install -r requirements.txt
 # Set environment (or use .env)
 export DATABASE_URL="postgresql://dev_user:dev123@localhost:5432/davidlong_tech?sslmode=disable"
 export JWT_SECRET="dev-secret-change-in-production"
+# Optional: for AI "Edit for clarity" (light edit)
+export OPENAI_API_KEY="sk-..."
+export OPENAI_EDIT_MODEL="gpt-4o-mini"   # default
 
 # Run
 flask run --port 5000
@@ -67,3 +70,12 @@ flask run --port 5000
 ```bash
 git push heroku main
 ```
+
+### AI light edit (optional)
+
+The "Edit for clarity" feature calls OpenAI from the backend. On Heroku, set:
+
+- **OPENAI_API_KEY** (required if you use the feature): your OpenAI API key (Settings → Config Vars).
+- **OPENAI_EDIT_MODEL** (optional): default `gpt-4o-mini`. Set to `gpt-4o` for higher quality.
+
+If `OPENAI_API_KEY` is not set, the endpoint returns 503 and the frontend shows an error.

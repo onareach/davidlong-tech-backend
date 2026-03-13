@@ -3,6 +3,9 @@
 # Flask app for Research Studio and site auth.
 # Deploys to Heroku; frontend (Vercel) proxies /api/* to this backend.
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 import psycopg2
@@ -10,6 +13,7 @@ import os
 import jwt
 import bcrypt
 from datetime import datetime, timedelta
+from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -36,6 +40,8 @@ if not DATABASE_URL:
     DATABASE_URL = "postgresql://dev_user:dev123@localhost:5432/davidlong_tech?sslmode=disable"
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
 AUTH_COOKIE_NAME = "davidlong_tech_token"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_EDIT_MODEL = os.environ.get("OPENAI_EDIT_MODEL", "gpt-4o-mini")
 
 
 # ---------------------------------------------------------------------------
@@ -549,6 +555,123 @@ def entries_update(entry_id):
         return jsonify({"entry": _entry_response(row)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+LIGHT_EDIT_SYSTEM_PROMPT = (
+    "You are an editor. Improve clarity and flow without changing the author's voice. "
+    "Output only the revised text, no commentary or meta-comment."
+)
+
+
+def _log_ai_operation(cur, entry_id, op_type, model_name, prompt_used, response_text, success, error_message=None):
+    cur.execute(
+        """
+        INSERT INTO tbl_ai_operations (
+            research_entry_id, ai_operation_type, ai_model_name, ai_prompt_used,
+            ai_response_text, ai_operation_success, ai_operation_error_message
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            entry_id,
+            op_type,
+            model_name,
+            (prompt_used or "")[:10000],
+            (response_text or "")[:100000],
+            success,
+            (error_message or "")[:2000] if error_message else None,
+        ),
+    )
+
+
+@app.route("/api/entries/<int:entry_id>/light-edit", methods=["POST"])
+def entries_light_edit(entry_id):
+    """Run AI light edit on entry raw text; store result in edited_text. Requires auth; user must own the entry."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "AI edit is not configured"}), 503
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT research_entry_id, user_id, research_prompt_id, research_entry_title,
+                   research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                   research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                   research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            FROM tbl_research_entries
+            WHERE research_entry_id = %s AND user_id = %s
+            """,
+            (entry_id, claims["user_id"]),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Entry not found"}), 404
+        raw_text = (row[4] or "").strip()
+        if not raw_text:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Draft is empty; add text to the raw draft first"}), 400
+
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model=OPENAI_EDIT_MODEL,
+            messages=[
+                {"role": "system", "content": LIGHT_EDIT_SYSTEM_PROMPT},
+                {"role": "user", "content": raw_text},
+            ],
+        )
+        choice = response.choices[0] if response.choices else None
+        if not choice or not getattr(choice, "message", None):
+            _log_ai_operation(
+                cur, entry_id, "light_edit", OPENAI_EDIT_MODEL, LIGHT_EDIT_SYSTEM_PROMPT,
+                None, False, "Empty or invalid response from OpenAI",
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+            return jsonify({"error": "AI edit failed: no response"}), 502
+        edited_text = (choice.message.content or "").strip()
+
+        cur.execute(
+            """
+            UPDATE tbl_research_entries
+            SET research_entry_edited_text = %s, research_entry_updated_timestamp = NOW()
+            WHERE research_entry_id = %s AND user_id = %s
+            RETURNING research_entry_id, user_id, research_prompt_id, research_entry_title,
+                      research_entry_raw_text, research_entry_edited_text, research_entry_summary,
+                      research_entry_why_it_matters, research_branch_id, research_mystery_id,
+                      research_entry_status, research_entries_timestamp, research_entry_updated_timestamp
+            """,
+            (edited_text, entry_id, claims["user_id"]),
+        )
+        updated = cur.fetchone()
+        _log_ai_operation(
+            cur, entry_id, "light_edit", OPENAI_EDIT_MODEL, LIGHT_EDIT_SYSTEM_PROMPT,
+            edited_text, True, None,
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"entry": _entry_response(updated)})
+    except Exception as e:
+        err_msg = str(e)
+        try:
+            conn = _auth_db()
+            cur = conn.cursor()
+            _log_ai_operation(
+                cur, entry_id, "light_edit", OPENAI_EDIT_MODEL or "", LIGHT_EDIT_SYSTEM_PROMPT,
+                None, False, err_msg,
+            )
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+        return jsonify({"error": "AI edit failed. Try again."}), 502
 
 
 # ---------------------------------------------------------------------------
