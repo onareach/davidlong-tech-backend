@@ -272,6 +272,92 @@ def prompts_today():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/prompts", methods=["GET", "POST"])
+def prompts_list_or_create():
+    """GET: list prompts for replacement. POST: create custom prompt. Body: { "text": "..." }. Requires auth."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    if request.method == "GET":
+        try:
+            conn = _auth_db()
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT research_prompt_id, research_prompt_text, is_fallback
+                FROM tbl_research_prompts
+                ORDER BY is_fallback DESC, research_prompt_text
+                """
+            )
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            return jsonify({
+                "prompts": [
+                    {"id": r[0], "text": r[1], "is_fallback": r[2]}
+                    for r in rows
+                ]
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    # POST
+    data = request.get_json() or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO tbl_research_prompts (research_prompt_text, research_prompt_type, is_fallback, research_prompt_status)
+            VALUES (%s, 'custom', false, 'pending')
+            RETURNING research_prompt_id, research_prompt_text, is_fallback
+            """,
+            (text,),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"id": row[0], "text": row[1], "is_fallback": row[2]}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/prompts/<int:prompt_id>", methods=["PATCH"])
+def prompts_update(prompt_id):
+    """Update a prompt's text. Requires auth. Body: { "text": "..." }."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    data = request.get_json() or {}
+    text = (data.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": "text is required"}), 400
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE tbl_research_prompts
+            SET research_prompt_text = %s
+            WHERE research_prompt_id = %s
+            RETURNING research_prompt_id, research_prompt_text, is_fallback
+            """,
+            (text, prompt_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Prompt not found"}), 404
+        return jsonify({"id": row[0], "text": row[1], "is_fallback": row[2]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------------------------------------------------------------------------
 # Branches and Mysteries (read-only for dropdowns)
 # ---------------------------------------------------------------------------
@@ -330,6 +416,121 @@ def mysteries_list():
                 for r in rows
             ]
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _slugify(text):
+    """Make a URL-safe handle: lowercase, non-alphanumeric to underscore, collapse underscores, max 80 chars."""
+    if not text or not isinstance(text, str):
+        return "unnamed"
+    s = "".join(c if c.isalnum() else "_" for c in text.lower().strip())
+    while "__" in s:
+        s = s.replace("__", "_")
+    s = s.strip("_") or "unnamed"
+    return s[:80]
+
+
+def _unique_branch_handle(cur, base_handle):
+    """Return base_handle or base_handle_2, base_handle_3, ... that doesn't exist."""
+    cur.execute(
+        "SELECT research_branch_handle FROM tbl_research_branches WHERE research_branch_handle = %s",
+        (base_handle,),
+    )
+    if cur.fetchone() is None:
+        return base_handle
+    for i in range(2, 1000):
+        candidate = f"{base_handle}_{i}"
+        cur.execute(
+            "SELECT research_branch_handle FROM tbl_research_branches WHERE research_branch_handle = %s",
+            (candidate,),
+        )
+        if cur.fetchone() is None:
+            return candidate
+    return f"{base_handle}_{hash(base_handle) % 100000}"
+
+
+def _unique_mystery_handle(cur, base_handle):
+    """Return base_handle or base_handle_2, ... that doesn't exist."""
+    cur.execute(
+        "SELECT research_mystery_handle FROM tbl_research_mysteries WHERE research_mystery_handle = %s",
+        (base_handle,),
+    )
+    if cur.fetchone() is None:
+        return base_handle
+    for i in range(2, 1000):
+        candidate = f"{base_handle}_{i}"
+        cur.execute(
+            "SELECT research_mystery_handle FROM tbl_research_mysteries WHERE research_mystery_handle = %s",
+            (candidate,),
+        )
+        if cur.fetchone() is None:
+            return candidate
+    return f"{base_handle}_{hash(base_handle) % 100000}"
+
+
+@app.route("/api/branches", methods=["POST"])
+def branches_create():
+    """Create a new research branch. Requires auth. Body: { "name": "Branch name" }. Handle is derived from name (unique)."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    data = request.get_json() or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name is required"}), 400
+    description = (data.get("description") or "").strip() or None
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        base_handle = _slugify(name)
+        handle = _unique_branch_handle(cur, base_handle)
+        cur.execute(
+            """
+            INSERT INTO tbl_research_branches (research_branch_handle, research_branch_name, research_branch_description)
+            VALUES (%s, %s, %s)
+            RETURNING research_branch_id, research_branch_handle, research_branch_name
+            """,
+            (handle, name, description),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"id": row[0], "handle": row[1], "name": row[2]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mysteries", methods=["POST"])
+def mysteries_create():
+    """Create a new research mystery. Requires auth. Body: { "question": "The question?" }. Handle is derived from question (unique)."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    data = request.get_json() or {}
+    question = (data.get("question") or "").strip()
+    if not question:
+        return jsonify({"error": "question is required"}), 400
+    description = (data.get("description") or "").strip() or None
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        base_handle = _slugify(question)
+        handle = _unique_mystery_handle(cur, base_handle)
+        cur.execute(
+            """
+            INSERT INTO tbl_research_mysteries (research_mystery_handle, research_mystery_question, research_mystery_description)
+            VALUES (%s, %s, %s)
+            RETURNING research_mystery_id, research_mystery_handle, research_mystery_question
+            """,
+            (handle, question, description),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"id": row[0], "handle": row[1], "question": row[2]})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -420,9 +621,24 @@ def entries_create():
         return jsonify({"error": str(e)}), 500
 
 
+def _random_fallback_prompt(cur):
+    """Return (id, text, is_fallback) or None."""
+    cur.execute(
+        """
+        SELECT research_prompt_id, research_prompt_text, is_fallback
+        FROM tbl_research_prompts
+        WHERE is_fallback = true
+        ORDER BY RANDOM()
+        LIMIT 1
+        """
+    )
+    row = cur.fetchone()
+    return row
+
+
 @app.route("/api/entries/today", methods=["GET"])
 def entries_today():
-    """Get today's entry (most recent from current UTC date). Requires auth."""
+    """Get today's entry (most recent from current UTC date) and its prompt. If no entry, return a random prompt for a fresh session. Requires auth."""
     claims = _get_current_user()
     if not claims:
         return jsonify({"error": "Authentication required"}), 401
@@ -443,11 +659,32 @@ def entries_today():
             (claims["user_id"],),
         )
         row = cur.fetchone()
+        prompt_row = None
+        if row:
+            prompt_id = row[2]
+            if prompt_id is not None:
+                cur.execute(
+                    """
+                    SELECT research_prompt_id, research_prompt_text, is_fallback
+                    FROM tbl_research_prompts
+                    WHERE research_prompt_id = %s
+                    """,
+                    (prompt_id,),
+                )
+                prompt_row = cur.fetchone()
+            if prompt_row is None:
+                prompt_row = _random_fallback_prompt(cur)
+        else:
+            prompt_row = _random_fallback_prompt(cur)
         cur.close()
         conn.close()
-        if not row:
-            return jsonify({"entry": None})
-        return jsonify({"entry": _entry_response(row)})
+        entry = _entry_response(row) if row else None
+        prompt = (
+            {"id": prompt_row[0], "text": prompt_row[1], "is_fallback": prompt_row[2]}
+            if prompt_row
+            else None
+        )
+        return jsonify({"entry": entry, "prompt": prompt})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -512,6 +749,9 @@ def entries_update(entry_id):
         if "title" in data:
             updates.append("research_entry_title = %s")
             params.append(data.get("title"))
+        if "research_prompt_id" in data:
+            updates.append("research_prompt_id = %s")
+            params.append(data.get("research_prompt_id"))
         if "research_branch_id" in data:
             updates.append("research_branch_id = %s")
             params.append(data.get("research_branch_id"))
@@ -672,6 +912,99 @@ def entries_light_edit(entry_id):
         except Exception:
             pass
         return jsonify({"error": "AI edit failed. Try again."}), 502
+
+
+# ---------------------------------------------------------------------------
+# ABCs of AI — playground: prompt + optional model/params from request body
+# ---------------------------------------------------------------------------
+
+@app.route("/api/abc", methods=["POST"])
+def api_abc():
+    """Run a single user prompt through OpenAI with optional model and params. Requires auth. Model and params come from the request body (not env)."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    if not OPENAI_API_KEY:
+        return jsonify({"error": "AI is not configured (OPENAI_API_KEY missing)"}), 503
+    data = request.get_json() or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "prompt is required"}), 400
+    model = (data.get("model") or "").strip() or "gpt-4o-mini"
+    temperature = data.get("temperature")
+    if temperature is None:
+        temperature = 1.0
+    else:
+        try:
+            temperature = float(temperature)
+            temperature = max(0.0, min(2.0, temperature))
+        except (TypeError, ValueError):
+            temperature = 1.0
+    max_tokens = data.get("max_tokens")
+    if max_tokens is not None:
+        try:
+            max_tokens = int(max_tokens)
+            max_tokens = max(1, min(128000, max_tokens))
+        except (TypeError, ValueError):
+            max_tokens = 4096
+    else:
+        max_tokens = 4096
+    top_p = data.get("top_p")
+    if top_p is None:
+        top_p = 1.0
+    else:
+        try:
+            top_p = float(top_p)
+            top_p = max(0.0, min(1.0, top_p))
+        except (TypeError, ValueError):
+            top_p = 1.0
+    frequency_penalty = data.get("frequency_penalty")
+    if frequency_penalty is None:
+        frequency_penalty = 0.0
+    else:
+        try:
+            frequency_penalty = float(frequency_penalty)
+            frequency_penalty = max(-2.0, min(2.0, frequency_penalty))
+        except (TypeError, ValueError):
+            frequency_penalty = 0.0
+    presence_penalty = data.get("presence_penalty")
+    if presence_penalty is None:
+        presence_penalty = 0.0
+    else:
+        try:
+            presence_penalty = float(presence_penalty)
+            presence_penalty = max(-2.0, min(2.0, presence_penalty))
+        except (TypeError, ValueError):
+            presence_penalty = 0.0
+    stream = bool(data.get("stream", False))
+    system_content = (data.get("system") or "").strip()
+    messages = []
+    if system_content:
+        messages.append({"role": "system", "content": system_content})
+    messages.append({"role": "user", "content": prompt})
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        kwargs = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "frequency_penalty": frequency_penalty,
+            "presence_penalty": presence_penalty,
+            "stream": stream,
+        }
+        response = client.chat.completions.create(**kwargs)
+        if stream:
+            # For stream we'd need to iterate; this endpoint returns one blob for simplicity
+            return jsonify({"error": "stream=true not supported in this UI; use stream=false"}), 400
+        choice = response.choices[0] if response.choices else None
+        if not choice or not getattr(choice, "message", None):
+            return jsonify({"error": "No response from model"}), 502
+        content = (choice.message.content or "").strip()
+        return jsonify({"content": content})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 # ---------------------------------------------------------------------------
