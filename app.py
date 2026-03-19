@@ -12,6 +12,10 @@ import psycopg2
 import os
 import jwt
 import bcrypt
+import hashlib
+import secrets
+import json
+import urllib.request
 from datetime import datetime, timedelta
 from openai import OpenAI
 
@@ -42,6 +46,9 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
 AUTH_COOKIE_NAME = "davidlong_tech_token"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_EDIT_MODEL = os.environ.get("OPENAI_EDIT_MODEL", "gpt-4o-mini")
+
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+RESET_EXPIRY_HOURS = 1
 
 
 # ---------------------------------------------------------------------------
@@ -87,12 +94,88 @@ def _get_current_user():
         parts = request.headers.get("Authorization", "").strip().split()
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1]
-    return _verify_jwt(token)
+    claims = _verify_jwt(token)
+    if not claims:
+        return None
+    # Inactive accounts lose effective session immediately.
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(is_active, true) FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row or not row[0]:
+        return None
+    return claims
 
 
 def _user_response(user_row):
-    """user_row: (user_id, email, display_name)"""
-    return {"id": user_row[0], "email": user_row[1], "display_name": user_row[2]}
+    """user_row: (user_id, email, display_name) or (..., is_admin[, is_active])"""
+    is_admin = bool(user_row[3]) if len(user_row) > 3 else False
+    is_active = bool(user_row[4]) if len(user_row) > 4 else True
+    return {
+        "id": user_row[0],
+        "email": user_row[1],
+        "display_name": user_row[2],
+        "is_admin": is_admin,
+        "is_active": is_active,
+    }
+
+
+def _require_admin():
+    """Require authenticated admin. Returns (claims, None) or (None, (response, status))."""
+    claims = _get_current_user()
+    if not claims:
+        return None, (jsonify({"error": "Not authenticated"}), 401)
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(is_admin, false) FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row or not row[0]:
+        return None, (jsonify({"error": "Admin access required"}), 403)
+    return claims, None
+
+
+def _send_password_reset_email(to_email: str, reset_link: str) -> bool:
+    """Send password reset via SendGrid; log link if no API key."""
+    sendgrid_key = os.environ.get("SENDGRID_API_KEY")
+    if sendgrid_key:
+        try:
+            personalizations = [{"to": [{"email": to_email}]}]
+            bcc = (os.environ.get("SENDGRID_BCC") or "").strip()
+            if bcc:
+                personalizations[0]["bcc"] = [{"email": bcc}]
+            from_email = os.environ.get("RESET_EMAIL_FROM", "noreply@example.com")
+            req = urllib.request.Request(
+                "https://api.sendgrid.com/v3/mail/send",
+                data=json.dumps(
+                    {
+                        "personalizations": personalizations,
+                        "from": {"email": from_email, "name": "Research Studio (davidlong.tech)"},
+                        "subject": "Reset your password",
+                        "content": [
+                            {
+                                "type": "text/plain",
+                                "value": (
+                                    f"Use this link to set a new password (valid for {RESET_EXPIRY_HOURS} hour):\n\n"
+                                    f"{reset_link}\n\nIf you didn't request this, you can ignore this email."
+                                ),
+                            }
+                        ],
+                    }
+                ).encode(),
+                headers={"Authorization": f"Bearer {sendgrid_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 202)
+        except Exception as e:
+            app.logger.warning("SendGrid send failed: %s", e)
+            return False
+    app.logger.info("Password reset link (no SENDGRID_API_KEY): %s", reset_link)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +213,8 @@ def auth_register():
             return jsonify({"error": "An account with this email already exists"}), 409
         password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
         cur.execute(
-            "INSERT INTO tbl_user (email, password_hash, display_name) VALUES (%s, %s, %s) RETURNING user_id, email, display_name;",
+            "INSERT INTO tbl_user (email, password_hash, display_name) VALUES (%s, %s, %s) "
+            "RETURNING user_id, email, display_name, COALESCE(is_admin, false), COALESCE(is_active, true);",
             (email, password_hash, display_name),
         )
         row = cur.fetchone()
@@ -164,14 +248,14 @@ def auth_login():
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT user_id, email, display_name, password_hash FROM tbl_user WHERE email = %s;",
+            "SELECT user_id, email, display_name, password_hash, COALESCE(is_admin, false), COALESCE(is_active, true) FROM tbl_user WHERE email = %s;",
             (email,),
         )
         row = cur.fetchone()
         cur.close()
         conn.close()
         pw_hash = _password_hash_bytes(row[3]) if row else None
-        if not row or not pw_hash:
+        if not row or not pw_hash or not row[5]:
             return jsonify({"error": "Invalid email or password"}), 401
         try:
             if not bcrypt.checkpw(password.encode("utf-8"), pw_hash):
@@ -180,7 +264,9 @@ def auth_login():
             app.logger.warning("bcrypt.checkpw failed: %s", e)
             return jsonify({"error": "Invalid email or password"}), 401
         token = _create_jwt(row[0], row[1])
-        resp = make_response(jsonify({"user": _user_response((row[0], row[1], row[2])), "token": token}))
+        resp = make_response(
+            jsonify({"user": _user_response((row[0], row[1], row[2], row[4], row[5])), "token": token})
+        )
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             str(token),
@@ -220,7 +306,7 @@ def auth_me():
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT user_id, email, display_name FROM tbl_user WHERE user_id = %s;",
+            "SELECT user_id, email, display_name, COALESCE(is_admin, false), COALESCE(is_active, true) FROM tbl_user WHERE user_id = %s;",
             (claims["user_id"],),
         )
         row = cur.fetchone()
@@ -229,6 +315,256 @@ def auth_me():
         if not row:
             return jsonify({"user": None}), 200
         return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/auth/me", methods=["PATCH"])
+def auth_me_update():
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        data = request.get_json() or {}
+        conn = _auth_db()
+        cur = conn.cursor()
+        if data.get("new_password"):
+            new_password = data["new_password"]
+            current_password = data.get("current_password") or ""
+            if len(new_password) < 8:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "New password must be at least 8 characters"}), 400
+            cur.execute("SELECT password_hash FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+            row_pw = cur.fetchone()
+            pw_hash = _password_hash_bytes(row_pw[0]) if row_pw else None
+            if not row_pw or not pw_hash or not bcrypt.checkpw(current_password.encode("utf-8"), pw_hash):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Current password is incorrect"}), 401
+            password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            cur.execute(
+                "UPDATE tbl_user SET password_hash = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
+                (password_hash, claims["user_id"]),
+            )
+        if "email" in data:
+            new_email = (data.get("email") or "").strip().lower()
+            if not new_email:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Email cannot be empty"}), 400
+            cur.execute(
+                "SELECT user_id FROM tbl_user WHERE email = %s AND user_id != %s;",
+                (new_email, claims["user_id"]),
+            )
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return jsonify({"error": "That email is already in use"}), 409
+            cur.execute(
+                "UPDATE tbl_user SET email = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
+                (new_email, claims["user_id"]),
+            )
+        if "display_name" in data:
+            display_name = (data.get("display_name") or "").strip() or None
+            cur.execute(
+                "UPDATE tbl_user SET display_name = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;",
+                (display_name, claims["user_id"]),
+            )
+        cur.execute(
+            "SELECT user_id, email, display_name, COALESCE(is_admin, false), COALESCE(is_active, true) FROM tbl_user WHERE user_id = %s;",
+            (claims["user_id"],),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/auth/forgot-password", methods=["POST"])
+def auth_forgot_password():
+    """Request reset link. Same response whether or not email exists (no enumeration)."""
+    try:
+        data = request.get_json() or {}
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            return jsonify({"error": "Email is required"}), 400
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM tbl_user WHERE email = %s;", (email,))
+        found = cur.fetchone() is not None
+        if found:
+            cur.execute("DELETE FROM tbl_password_reset WHERE email = %s;", (email,))
+            token = secrets.token_urlsafe(32)
+            token_lookup = hashlib.sha256(token.encode()).hexdigest()
+            token_hash = bcrypt.hashpw(token.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            expires_at = datetime.utcnow() + timedelta(hours=RESET_EXPIRY_HOURS)
+            cur.execute(
+                "INSERT INTO tbl_password_reset (email, token_lookup, token_hash, expires_at) VALUES (%s, %s, %s, %s);",
+                (email, token_lookup, token_hash, expires_at),
+            )
+            conn.commit()
+            reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={token}"
+            _send_password_reset_email(email, reset_link)
+        else:
+            conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(
+            {
+                "ok": True,
+                "message": "If that email is registered, you will receive password reset instructions shortly.",
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/auth/reset-password", methods=["POST"])
+def auth_reset_password():
+    try:
+        data = request.get_json() or {}
+        token = (data.get("token") or "").strip()
+        new_password = data.get("new_password") or ""
+        if not token:
+            return jsonify({"error": "Reset token is required"}), 400
+        if len(new_password) < 8:
+            return jsonify({"error": "New password must be at least 8 characters"}), 400
+        token_lookup = hashlib.sha256(token.encode()).hexdigest()
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, email, token_hash, expires_at FROM tbl_password_reset WHERE token_lookup = %s AND expires_at > %s;",
+            (token_lookup, datetime.utcnow()),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Invalid or expired reset link. Request a new one."}), 400
+        _id, email, stored_hash, _exp = row
+        stored_bytes = _password_hash_bytes(stored_hash)
+        if not stored_bytes or not bcrypt.checkpw(token.encode("utf-8"), stored_bytes):
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Invalid or expired reset link. Request a new one."}), 400
+        password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cur.execute(
+            "UPDATE tbl_user SET password_hash = %s, updated_at = CURRENT_TIMESTAMP WHERE email = %s;",
+            (password_hash, email),
+        )
+        cur.execute("DELETE FROM tbl_password_reset WHERE id = %s;", (_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify(
+            {
+                "ok": True,
+                "message": "Password has been reset. You can sign in with your new password.",
+            }
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/users", methods=["GET"])
+def admin_list_users():
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, email, display_name, COALESCE(is_admin, false), COALESCE(is_active, true) "
+            "FROM tbl_user ORDER BY email;"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({"users": [_user_response(r) for r in rows]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/users/<int:target_user_id>", methods=["PATCH"])
+def admin_update_user(target_user_id):
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    if data.get("is_admin") is None:
+        return jsonify({"error": "is_admin is required"}), 400
+    is_admin = bool(data.get("is_admin"))
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        if not is_admin and target_user_id == claims["user_id"]:
+            cur.execute("SELECT COUNT(*) FROM tbl_user WHERE is_admin = true;")
+            admin_count = cur.fetchone()[0]
+            if admin_count <= 1:
+                cur.close()
+                conn.close()
+                return jsonify(
+                    {"error": "Cannot revoke your own admin rights when you are the only admin."}
+                ), 400
+        cur.execute(
+            "UPDATE tbl_user SET is_admin = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s "
+            "RETURNING user_id, email, display_name, COALESCE(is_admin, false), COALESCE(is_active, true);",
+            (is_admin, target_user_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"error": "User not found"}), 404
+        return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/admin/users/<int:target_user_id>/activation", methods=["PATCH"])
+def admin_update_user_activation(target_user_id):
+    """Toggle account activation. Admin accounts cannot be inactivated."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    if data.get("is_active") is None:
+        return jsonify({"error": "is_active is required"}), 400
+    is_active = bool(data.get("is_active"))
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, COALESCE(is_admin, false), COALESCE(is_active, true) FROM tbl_user WHERE user_id = %s;",
+            (target_user_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "User not found"}), 404
+        _id, target_is_admin, _target_is_active = row
+        if target_is_admin and not is_active:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Admin accounts cannot be inactivated. Remove admin first."}), 400
+
+        cur.execute(
+            "UPDATE tbl_user SET is_active = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s "
+            "RETURNING user_id, email, display_name, COALESCE(is_admin, false), COALESCE(is_active, true);",
+            (is_active, target_user_id),
+        )
+        updated = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"user": _user_response(updated)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -362,6 +698,33 @@ def prompts_update(prompt_id):
 # Branches and Mysteries (read-only for dropdowns)
 # ---------------------------------------------------------------------------
 
+
+def _branch_visible_to_user(cur, branch_id, user_id):
+    if branch_id is None:
+        return True
+    cur.execute(
+        """
+        SELECT 1 FROM tbl_research_branches
+        WHERE research_branch_id = %s AND (user_id IS NULL OR user_id = %s)
+        """,
+        (branch_id, user_id),
+    )
+    return cur.fetchone() is not None
+
+
+def _mystery_visible_to_user(cur, mystery_id, user_id):
+    if mystery_id is None:
+        return True
+    cur.execute(
+        """
+        SELECT 1 FROM tbl_research_mysteries
+        WHERE research_mystery_id = %s AND (user_id IS NULL OR user_id = %s)
+        """,
+        (mystery_id, user_id),
+    )
+    return cur.fetchone() is not None
+
+
 @app.route("/api/branches", methods=["GET"])
 def branches_list():
     """List all research branches. Requires auth."""
@@ -375,8 +738,10 @@ def branches_list():
             """
             SELECT research_branch_id, research_branch_handle, research_branch_name
             FROM tbl_research_branches
+            WHERE user_id IS NULL OR user_id = %s
             ORDER BY research_branch_name
-            """
+            """,
+            (claims["user_id"],),
         )
         rows = cur.fetchall()
         cur.close()
@@ -404,8 +769,10 @@ def mysteries_list():
             """
             SELECT research_mystery_id, research_mystery_handle, research_mystery_question
             FROM tbl_research_mysteries
+            WHERE user_id IS NULL OR user_id = %s
             ORDER BY research_mystery_question
-            """
+            """,
+            (claims["user_id"],),
         )
         rows = cur.fetchall()
         cur.close()
@@ -487,11 +854,11 @@ def branches_create():
         handle = _unique_branch_handle(cur, base_handle)
         cur.execute(
             """
-            INSERT INTO tbl_research_branches (research_branch_handle, research_branch_name, research_branch_description)
-            VALUES (%s, %s, %s)
+            INSERT INTO tbl_research_branches (research_branch_handle, research_branch_name, research_branch_description, user_id)
+            VALUES (%s, %s, %s, %s)
             RETURNING research_branch_id, research_branch_handle, research_branch_name
             """,
-            (handle, name, description),
+            (handle, name, description, claims["user_id"]),
         )
         row = cur.fetchone()
         conn.commit()
@@ -520,11 +887,11 @@ def mysteries_create():
         handle = _unique_mystery_handle(cur, base_handle)
         cur.execute(
             """
-            INSERT INTO tbl_research_mysteries (research_mystery_handle, research_mystery_question, research_mystery_description)
-            VALUES (%s, %s, %s)
+            INSERT INTO tbl_research_mysteries (research_mystery_handle, research_mystery_question, research_mystery_description, user_id)
+            VALUES (%s, %s, %s, %s)
             RETURNING research_mystery_id, research_mystery_handle, research_mystery_question
             """,
-            (handle, question, description),
+            (handle, question, description, claims["user_id"]),
         )
         row = cur.fetchone()
         conn.commit()
@@ -737,6 +1104,19 @@ def entries_update(entry_id):
             cur.close()
             conn.close()
             return jsonify({"error": "Entry not found"}), 404
+
+        if "research_branch_id" in data:
+            bid = data.get("research_branch_id")
+            if bid is not None and not _branch_visible_to_user(cur, bid, claims["user_id"]):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Invalid or inaccessible branch"}), 400
+        if "research_mystery_id" in data:
+            mid = data.get("research_mystery_id")
+            if mid is not None and not _mystery_visible_to_user(cur, mid, claims["user_id"]):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Invalid or inaccessible mystery"}), 400
 
         updates = []
         params = []
