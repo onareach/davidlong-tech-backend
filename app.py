@@ -1177,6 +1177,30 @@ def entries_update(entry_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/entries/<int:entry_id>", methods=["DELETE"])
+def entries_delete(entry_id):
+    """Delete an entry. Requires auth; user must own the entry."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Authentication required"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM tbl_research_entries WHERE research_entry_id = %s AND user_id = %s",
+            (entry_id, claims["user_id"]),
+        )
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "Entry not found"}), 404
+        return jsonify({"ok": True}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 LIGHT_EDIT_SYSTEM_PROMPT = (
     "You are an editor. Improve clarity and flow without changing the author's voice. "
     "Output only the revised text, no commentary or meta-comment."
